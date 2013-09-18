@@ -12,6 +12,7 @@ package org.eclipse.wst.server.ui.internal;
 
 import java.util.*;
 
+import org.eclipse.core.expressions.*;
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.*;
@@ -32,6 +33,7 @@ import org.eclipse.wst.server.core.*;
 import org.eclipse.wst.server.core.internal.*;
 import org.eclipse.wst.server.core.model.LaunchableAdapterDelegate;
 import org.eclipse.wst.server.core.util.PublishAdapter;
+import org.eclipse.wst.server.ui.IServerDeletionOperation;
 import org.eclipse.wst.server.ui.editor.ServerEditorOverviewPageModifier;
 import org.eclipse.wst.server.ui.internal.actions.RunOnServerActionDelegate;
 import org.eclipse.wst.server.ui.internal.editor.IServerEditorInput;
@@ -93,6 +95,9 @@ public class ServerUIPlugin extends AbstractUIPlugin {
 	
 	// cached initial selection provider
 	private static InitialSelectionProvider selectionProvider;
+	
+	// Cached copy of delete server additional options
+	private static List<DeleteOption>  deleteOptions;
 
 	private static IRegistryChangeListener registryListener;
 
@@ -744,6 +749,16 @@ public class ServerUIPlugin extends AbstractUIPlugin {
 		
 		return selectionProvider;
 	}
+	
+	/**
+	 * Returns the delete server additional options.
+	 *
+	 * @return delete server additional options, or empty map if none could be found
+	 */
+	public static List<DeleteOption> getDeleteOptions(IServer[] servers) {
+		reloadDeleteOptions(servers);
+		return deleteOptions;
+	}
 
  	/**
 	 * Returns the server label provider. There is always a server label provider for a server type
@@ -954,6 +969,155 @@ public class ServerUIPlugin extends AbstractUIPlugin {
 			Trace.trace(Trace.STRING_CONFIG, "-<- Done loading .initialSelectionProvider extension point -<-");
 		}
 	}
+	
+	/**
+	 * Load the initial delete options.
+	 */
+	private static synchronized void reloadDeleteOptions(IServer[] servers) {
+		if (Trace.CONFIG) {
+			Trace.trace(Trace.STRING_CONFIG, "->- Loading .deleteServerOptions extension point ->-");
+		}
+		IExtensionRegistry registry = Platform.getExtensionRegistry();
+		IConfigurationElement[] cf = registry.getConfigurationElementsFor(ServerUIPlugin.PLUGIN_ID, "deleteServerOptions");
+		if (cf.length > 0) {
+			deleteOptions = new ArrayList<DeleteOption>(cf.length);
+			for (IConfigurationElement ce : cf) {
+				try {
+					if (testApplicable(ce, servers)) {
+						String[] serverTypes = ServerPlugin.tokenize(ce.getAttribute("serverTypes"), ",");
+						if (testServerTypes(serverTypes, servers)) {
+							String id = ce.getAttribute("id");
+							Integer order;
+							try {
+								order = new Integer(ce.getAttribute("order") );	
+							} catch (NumberFormatException nfe) {
+								order = null;
+							}  
+							String label = ce.getAttribute("label");
+							boolean selected = Boolean.parseBoolean(ce.getAttribute("selected"));
+							IServerDeletionOperation operation;
+							try {
+								operation = (IServerDeletionOperation) ce.createExecutableExtension("operation");
+								operation.setServers(servers);
+							} catch (CoreException e) {
+								operation = null;
+							}
+							String parent = ce.getAttribute("parent");
+							DeleteOption option = new DeleteOption(id, order, label, selected, operation, serverTypes, parent);
+							if (Trace.CONFIG) {
+								Trace.trace(Trace.STRING_CONFIG,
+										"  Loaded .deleteServerOption: " + id + ", order=" + order
+												+ ", label=" + label + ", selected=" + selected + ", operation=" 
+												+ operation + ", serverTypes=" + ce.getAttribute("serverTypes")
+												+ ", parent=" + parent);
+							}
+							deleteOptions.add(option);
+						}
+					}
+				} catch (Throwable t) {
+					if (Trace.SEVERE) {
+						Trace.trace(Trace.STRING_SEVERE,
+								"  Could not load .deleteServerOption: " + ce.getAttribute("id"), t);
+					}					
+				}
+			}
+			populateChildren();
+		} else {
+			deleteOptions = new ArrayList<DeleteOption>();
+			if (Trace.CONFIG) {
+				Trace.trace(Trace.STRING_CONFIG, "No delete server options found");
+			}
+			
+		}
+		if (Trace.CONFIG) {
+			Trace.trace(Trace.STRING_CONFIG, "-<- Done loading .deleteServerOption extension point -<-");
+		}
+	}
+
+	/**
+	 * Populates the delete options children
+	 * 
+	 * @param deleteOptions2 delete options
+	 */
+	private static void populateChildren() {
+		for (DeleteOption option : deleteOptions) {
+			String parent = option.getParent();
+			if (parent != null && !parent.equalsIgnoreCase(option.getId())) {
+				for (DeleteOption option2 : deleteOptions) {
+					if (option2.getId().equalsIgnoreCase(parent)) {
+						List<DeleteOption> children = option2.getChildren();
+						if (children == null) {
+							children = new ArrayList<DeleteOption>();
+						}
+						children.add(option);
+						option2.setChildren(children);
+						break;
+					}
+				}
+			}
+		}
+	}
+	
+	/**
+	 * Tests if an option is applicable in the given environment.
+	 * 
+	 * @param configurationElement extension descriptor
+	 * @param o object representing the current environment
+	 * @return true if option is applicable, false otherwise
+	 */
+	private static boolean testApplicable(IConfigurationElement configurationElement, Object o) {
+		IConfigurationElement[] children = configurationElement.getChildren("enablement");
+        if(children != null) {
+        	for (int i = 0; i < children.length; i++) {
+        		if ("enablement".equals(children[i].getName())){
+        			try {
+        				return testEnablement(children[i],o);
+        			} catch (CoreException e) {
+                        //nothing to do testEnablement fails.
+        				return false;
+        			}
+    			}              
+            }
+        }
+        return true;
+    }
+
+
+	/**
+	 * Evaluates the option expression. Returns the result of the expression.
+	 * 
+	 * @param configurationElement extension descriptor
+	 * @param o object representing the current environment
+	 * @return expression result
+	 * @throws CoreException
+	 */
+	private static boolean testEnablement(IConfigurationElement configurationElement, Object o) throws CoreException{
+        Expression exp= ExpressionConverter.getDefault().perform(configurationElement);
+        EvaluationContext context = new EvaluationContext(null, o);
+        context.setAllowPluginActivation(true);
+        return EvaluationResult.TRUE == exp.evaluate(context);
+	}
+	
+
+	/**
+	 * Matches the option server types against the servers for which the delete dialog is called.
+	 * Depending on that is decided if the option is applicable and should be shown in the delete dialog.
+	 * 
+	 * @param serverTypes String[] of server types for which the option is applicable
+	 * @param servers IServer[] of servers for which the dialog is called
+	 * @return any of the serverTypes is the same as the one of the servers
+	 */
+	private static boolean testServerTypes(String[] serverTypes, IServer[] servers) {
+		for (String serverType : serverTypes) {
+			for (IServer server : servers) {
+				if (server.getServerType().getId().equalsIgnoreCase(serverType)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 
 	protected static WizardFragment getWizardFragment(WizardFragmentData fragment) {
 		if (fragment == null)

@@ -10,16 +10,12 @@
  *******************************************************************************/
 package org.eclipse.wst.server.ui.internal;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.LinkedList;
+import java.util.*;
 import java.util.List;
 
-import org.eclipse.core.resources.IFolder;
-import org.eclipse.core.resources.IResource;
-import org.eclipse.core.resources.IResourceRuleFactory;
-import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.commands.ExecutionException;
+import org.eclipse.core.commands.operations.IUndoableOperation;
+import org.eclipse.core.resources.*;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Status;
@@ -35,13 +31,11 @@ import org.eclipse.swt.events.SelectionAdapter;
 import org.eclipse.swt.events.SelectionEvent;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
-import org.eclipse.swt.widgets.Button;
-import org.eclipse.swt.widgets.Composite;
-import org.eclipse.swt.widgets.Control;
-import org.eclipse.swt.widgets.Shell;
+import org.eclipse.swt.widgets.*;
 import org.eclipse.ui.PlatformUI;
 import org.eclipse.wst.server.core.IServer;
 import org.eclipse.wst.server.core.IServer.IOperationListener;
+import org.eclipse.wst.server.ui.IServerDeletionOperation;
 /**
  * Dialog that prompts a user to delete server(s) and/or server configuration(s).
  */
@@ -55,6 +49,7 @@ public class DeleteServerDialog extends MessageDialog {
 	protected Button checkDeleteConfigs;
 	protected Button checkDeleteRunning;
 	protected Button checkDeleteRunningStop;
+	protected Map<Button, DeleteOption> checkDeleteOptionsMap;
 
 	/**
 	 * DeleteServerDialog constructor comment.
@@ -137,9 +132,56 @@ public class DeleteServerDialog extends MessageDialog {
 			}
 		}
 		
+		List<DeleteOption> deleteOptions = ServerUIPlugin.getDeleteOptions(servers);
+		if (deleteOptions.size() > 0) {
+			checkDeleteOptionsMap = new HashMap<Button, DeleteOption>();
+			addAdditionalOptions(deleteOptions, null, composite, 0);
+		}
+	
 		Dialog.applyDialogFont(composite);
 		
 		return composite;
+	}
+	
+	/**
+	 * Adds additional options to the server delete dialog.
+	 * 
+	 * @param deleteOptions - list of the {@link DeleteOption}
+	 * @param parentButton - parent button if applicable, otherwise {@code null}
+	 * @param parent - parent composite
+	 * @param indent - level of indentation
+	 */
+	protected void addAdditionalOptions(List<DeleteOption> deleteOptions, final Button parentButton, Composite parent, int indent) {
+		boolean isRootOption = indent == 0;
+		GridData data = new GridData();
+		if(!isRootOption) {
+			data.horizontalIndent = 15 * indent;
+		}
+		Collections.sort(deleteOptions);
+		for (DeleteOption option : deleteOptions) {
+			if (isRootOption && option.getParent() != null) {
+				// this option is not a parent one
+				continue;
+			}
+			final Button button = new Button(parent, SWT.CHECK);
+			button.setText(option.getLabel());
+			button.setSelection(option.isSelected());
+			if (!isRootOption) {
+				button.setEnabled(parentButton.getSelection());
+				button.setLayoutData(data);
+				parentButton.addSelectionListener(new SelectionAdapter() {
+					public void widgetSelected(SelectionEvent e) {
+						button.setEnabled(parentButton.getSelection() && parentButton.isEnabled());
+						button.notifyListeners(SWT.Selection, new Event());
+					}
+				});
+			}
+			checkDeleteOptionsMap.put(button, option);
+			List<DeleteOption> children = option.getChildren();
+			if (children != null) {
+				addAdditionalOptions(children, button, parent, ++indent);
+			}
+		}	
 	}
 
 	protected void buttonPressed(int buttonId) {
@@ -148,8 +190,22 @@ public class DeleteServerDialog extends MessageDialog {
 			final boolean deleteRunning = (checkDeleteRunning == null || checkDeleteRunning.getSelection());
 			final boolean deleteRunningStop = (checkDeleteRunningStop != null && checkDeleteRunningStop.getSelection());
 			
+			final List<IServerDeletionOperation> operations = new ArrayList<IServerDeletionOperation>();
+			if (checkDeleteOptionsMap != null && checkDeleteOptionsMap.size() > 0) {
+				Set<Button> buttons = checkDeleteOptionsMap.keySet();
+				for (Button button : buttons) {
+					if (button.isEnabled() && button.getSelection()) {
+						IServerDeletionOperation operation = checkDeleteOptionsMap.get(button).getOperation();
+						if (operation != null) {
+							operations.add(operation);
+						}
+					}
+				}
+			}
+			
 			Thread t = new Thread("Delete servers") {
 				public void run() {
+					
 					if (runningServersList.size() > 0) {
 						// stop servers and/or updates servers' list
 						prepareForDeletion(deleteRunning, deleteRunningStop);
@@ -164,6 +220,14 @@ public class DeleteServerDialog extends MessageDialog {
 							try {
 								if (monitor.isCanceled())
 									return Status.CANCEL_STATUS;
+							
+								for (IUndoableOperation operation : operations) {
+									try {
+										operation.execute(monitor, null);
+									} catch (ExecutionException e) {
+										return Status.CANCEL_STATUS;
+									}
+								}
 								
 								int size = servers.length;
 								for (int i = 0; i < size; i++)
